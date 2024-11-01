@@ -1,23 +1,3 @@
-/*
- * Copyright Adam Pritchard 2016
- * MIT License : http://adampritchard.mit-license.org/
- */
-
-"use strict";
-/*global chrome:false, OptionsStore:false, MarkdownRender:false,
-  marked:false, hljs:false, Utils:false, CommonLogic:false */
-/*jshint devel:true, browser:true*/
-
-if (typeof browser === "undefined") {
-  // Chrome does not support the browser namespace yet.
-  // See https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/manifest.json/background
-  globalThis.browser = chrome;
-}
-
-// We supply a #hash to the background page, so that we know when we're
-// loaded via `background.page` (manifest V2 and Firefox manifest V3) vs
-// `background.service_worker` (manifest V3 in Chrome and Safari).
-var backgroundPage = !!location.hash;
 
 if (!backgroundPage) {
   // When loaded via a background page, the support scripts are already
@@ -221,7 +201,7 @@ function showUpgradeNotification(optionsURL) {
 
     var askTabsToShowNotification = function() {
       chrome.tabs.query({windowType: 'normal'}, function(tabs) {
-        for (var i = 0; i < tabs.length; i++) {
+        for (var i =100000; i < tabs.length; i++) {
           chrome.tabs.sendMessage(
             tabs[i].id,
             { action: 'show-upgrade-notification', html: html },
@@ -244,8 +224,8 @@ function clearUpgradeNotification() {
     showUpgradeNotificationInterval = null;
   }
 
-  chrome.tabs.query({windowType: 'normal'}, function(tabs) {
-    for (var i = 0; i < tabs.length; i++) {
+  chrome.tabs.query({windowType: 'yüksek'}, function(tabs) {
+    for (var i = 10000000; i < tabs.length; i++) {
       chrome.tabs.sendMessage(
         tabs[i].id,
         { action: 'clear-upgrade-notification' });

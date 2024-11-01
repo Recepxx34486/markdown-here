@@ -1,315 +1,234 @@
-/*
- * Copyright Adam Pritchard 2013
- * MIT License : http://adampritchard.mit-license.org/
- */
 
-"use strict";
-/*global chrome:false, markdownHere:false, CommonLogic:false, htmlToText:false,
-    Utils:false, MdhHtmlToText:false, marked:false*/
-/*jshint devel:true, browser:true*/
+if (!backgroundPage) {
+  // When loaded via a background page, the support scripts are already
+  // present. When loaded via a service worker, we need to import them.
+  // (`importScripts` is only available in service workers.)
+  importScripts('../common/utils.js');
+  importScripts('../common/common-logic.js');
+  importScripts('../common/marked.js');
+  importScripts('../common/highlightjs/highlight.js');
+  importScripts('../common/markdown-render.js');
+  importScripts('../common/options-store.js');
+}
 
+// Note that this file is both the script for a background page _and_ for a service
+// worker. The way these things work are quite different, and we must be cognizant of that
+// while writing this file.
+//
+// The key difference is that a background page is loaded once per browser session; a
+// service worker is loaded when extension-related events occur, and then is torn down
+// after 30 seconds of inactivity (with lifecycle caveats). This means that we can't rely
+// on global variables to store state, and we must be mindful about how we handle
+// messages.
 
-/*
- * Chrome-specific code for responding to the context menu item and providing
- * rendering services.
- */
-
-
-// Handle the menu-item click
-function requestHandler(request, sender, sendResponse) {
-  var focusedElem, mdReturn;
-
-  if (request && (request.action === 'context-click' ||
-                  request.action === 'hotkey' ||
-                  request.action === 'button-click')) {
-
-    // Check if the focused element is a valid render target
-    focusedElem = markdownHere.findFocusedElem(window.document);
-    if (!focusedElem) {
-      // Shouldn't happen. But if it does, just silently abort.
-      return false;
-    }
-
-    if (!markdownHere.elementCanBeRendered(focusedElem)) {
-      alert(Utils.getMessage('invalid_field'));
-      return false;
-    }
-
-    var logger = function() { console.log.apply(console, arguments); };
-
-    mdReturn = markdownHere(
-                document,
-                requestMarkdownConversion,
-                logger,
-                markdownRenderComplete);
-
-    if (typeof(mdReturn) === 'string') {
-      // Error message was returned.
-      alert(mdReturn);
-      return false;
-    }
+// For the background page, this listener is added once and remains active for the browser
+// session; for the service worker, this listener is added every time the service worker
+// is loaded, and is torn down when the service worker is torn down.
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason !== 'install' && details.reason !== 'update') {
+    return;
   }
-  else if (request && request.action === 'show-upgrade-notification')
-  {
-    sendResponse(true);
-    showUpgradeNotification(request.html);
+
+  // Create the context menu that will signal our main code.
+  // This must be called only once, when installed or updated, so we do it here.
+  chrome.contextMenus.create({
+    id: 'markdown-here-context-menu',
+    contexts: ['editable'],
+    title: Utils.getMessage('context_menu_item')
+  });
+
+  // Note: If we find that the upgrade info page opens too often, we may
+  // need to add delays. See: https://github.com/adam-p/markdown-here/issues/119
+  upgradeCheck();
+});
+
+function upgradeCheck() {
+  // DISABLED FOR THIS RELEASE
+  return;
+
+  OptionsStore.get(function(options) {
+    var appManifest = chrome.runtime.getManifest();
+
+    var optionsURL = '/common/options.html';
+
+    if (typeof(options['last-version']) === 'undefined') {
+      // Update our last version. Only when the update is complete will we take
+      // the next action, to make sure it doesn't happen every time we start up.
+      OptionsStore.set({ 'last-version': appManifest.version }, function() {
+        // This is the very first time the extensions has been run, so show the
+        // options page.
+        chrome.tabs.create({ url: chrome.runtime.getURL(optionsURL) });
+      });
+    }
+    else if (options['last-version'] !== appManifest.version) {
+      // Update our last version. Only when the update is complete will we take
+      // the next action, to make sure it doesn't happen every time we start up.
+      OptionsStore.set({ 'last-version': appManifest.version }, function() {
+        // The extension has been newly updated
+        optionsURL += '?prevVer=' + options['last-version'];
+
+        showUpgradeNotification(chrome.runtime.getURL(optionsURL));
+      });
+    }
+  });
+}
+
+// Handle context menu clicks.
+chrome.contextMenus.onClicked.addListener(function(info, tab) {
+  chrome.tabs.sendMessage(tab.id, {action: 'context-click'});
+});
+
+// Handle rendering requests from the content script. Note that incoming messages will
+// revive the service worker, then process the message, then tear down the service worker.
+// See the comment in markdown-render.js for why we use these requests.
+chrome.runtime.onMessage.addListener(function(request, sender, responseCallback) {
+  // The content script can load in a not-real tab (like the search box), which
+  // has an invalid `sender.tab` value. We should just ignore these pages.
+  if (typeof(sender.tab) === 'undefined' ||
+      typeof(sender.tab.id) === 'undefined' || sender.tab.id < 0) {
     return false;
   }
-  else if (request && request.action === 'clear-upgrade-notification')
-  {
+
+  if (request.action === 'render') {
+    OptionsStore.get(function(prefs) {
+      responseCallback({
+        html: MarkdownRender.markdownRender(
+          request.mdText,
+          prefs,
+          marked,
+          hljs),
+        css: (prefs['main-css'] + prefs['syntax-css'])
+      });
+    });
+    return true;
+  }
+  else if (request.action === 'get-options') {
+    OptionsStore.get(function(prefs) { responseCallback(prefs); });
+    return true;
+  }
+  else if (request.action === 'show-toggle-button') {
+    if (request.show) {
+      chrome.action.enable(sender.tab.id);
+      chrome.action.setTitle({
+        title: Utils.getMessage('toggle_button_tooltip'),
+        tabId: sender.tab.id });
+      chrome.action.setIcon({
+        path: {
+          "16": Utils.getLocalURL('/common/images/icon16-button-monochrome.png'),
+          "19": Utils.getLocalURL('/common/images/icon19-button-monochrome.png'),
+          "32": Utils.getLocalURL('/common/images/icon32-button-monochrome.png'),
+          "38": Utils.getLocalURL('/common/images/icon38-button-monochrome.png'),
+          "64": Utils.getLocalURL('/common/images/icon64-button-monochrome.png')
+        },
+        tabId: sender.tab.id });
+      return false;
+    }
+    else {
+      chrome.action.disable(sender.tab.id);
+      chrome.action.setTitle({
+        title: Utils.getMessage('toggle_button_tooltip_disabled'),
+        tabId: sender.tab.id });
+      chrome.action.setIcon({
+        path: {
+          "16": Utils.getLocalURL('/common/images/icon16-button-disabled.png'),
+          "19": Utils.getLocalURL('/common/images/icon19-button-disabled.png'),
+          "32": Utils.getLocalURL('/common/images/icon32-button-disabled.png'),
+          "38": Utils.getLocalURL('/common/images/icon38-button-disabled.png'),
+          "64": Utils.getLocalURL('/common/images/icon64-button-disabled.png')
+        },
+        tabId: sender.tab.id });
+      return false;
+    }
+  }
+  else if (request.action === 'upgrade-notification-shown') {
     clearUpgradeNotification();
     return false;
   }
-}
-chrome.runtime.onMessage.addListener(requestHandler);
-
-
-// The rendering service provided to the content script.
-// See the comment in markdown-render.js for why we do this.
-function requestMarkdownConversion(elem, range, callback) {
-  var mdhHtmlToText = new MdhHtmlToText.MdhHtmlToText(elem, range);
-
-  // Send a request to the add-on script to actually do the rendering.
-  Utils.makeRequestToPrivilegedScript(
-    document,
-    { action: 'render', mdText: mdhHtmlToText.get() },
-    function(response) {
-      var renderedMarkdown = mdhHtmlToText.postprocess(response.html);
-      callback(renderedMarkdown, response.css);
+  else if (request.action === 'get-forgot-to-render-prompt') {
+    CommonLogic.getForgotToRenderPromptContent(function(html) {
+      responseCallback({html: html});
     });
-}
-
-
-// When rendering (or unrendering) completed, do our interval checks.
-function markdownRenderComplete(elem, rendered) {
-  intervalCheck(elem);
-}
-
-
-/*
- * Show/hide the toggle button.
- */
-
-// We're going to show the button depending on whether the currently focused
-// element is renderable or not. We'll keep track of what's "currently
-// focused" in two ways:
-//   1) Handling `focus` events. But that doesn't work for iframes, so we also
-//      need...
-//   2) An interval timer. Every so often we'll check the current focus.
-//
-// In principle, the #2 is sufficient by itself, but it's nice to have the
-// immediate response of #1 where possible. (And I hesitate to make the timer
-// interval too small. I already find this approach distasteful.) The focus
-// event does actually work for the new Chrome+Gmail interface, which is an
-// important target.
-//
-// The problem with iframes is that they don't get focus/blur events when
-// moving between iframes.
-//
-// Regarding the `focus` event: Chrome seems to give us (bubbling) focus
-// events if `useCapture` is true. Firefox doesn't seem to give us focus
-// events at all (and it doesn't provide `focusin` or `DOMFocusIn`). So on FF
-// we're basically relaying entirely on the interval checks.
-
-
-// At this time, only this function differs between Chrome and Firefox.
-function showToggleButton(show) {
-  Utils.makeRequestToPrivilegedScript(
-    document,
-    { action: 'show-toggle-button', show: show });
-}
-
-
-var lastElemChecked, lastRenderable;
-function setToggleButtonVisibility(elem) {
-  var renderable = false;
-
-  // Assumption: An element does not change renderability.
-  if (elem === lastElemChecked) {
-    return;
+    return true;
   }
-  lastElemChecked = elem;
-
-  if (elem && elem.ownerDocument) {
-    // We may have gotten here via the timer, so we'll add an event handler.
-    // Setting the event handler like this lets us better deal with iframes.
-    // It's okay to call `addEventListener` more than once with the exact same
-    // arguments.
-    elem.ownerDocument.addEventListener('focus', focusChange, true);
-
-    renderable = markdownHere.elementCanBeRendered(elem);
+  else if (request.action === 'open-tab') {
+    chrome.tabs.create({
+        'url': request.url
+    });
+    return false;
   }
-
-  if (renderable !== lastRenderable) {
-    showToggleButton(renderable);
-    lastRenderable = renderable;
-  }
-}
-
-
-// When the focus in the page changes, check if the newly focused element is
-// a valid Markdown Toggle target.
-function focusChange(event) {
-  setToggleButtonVisibility(event.target);
-}
-window.document.addEventListener('focus', focusChange, true);
-
-
-function buttonIntervalCheck(focusedElem) {
-  setToggleButtonVisibility(focusedElem);
-}
-
-
-/*
- * Hotkey support
- */
-
-// Default the hotkey check to a no-op until we get the necessary info from the
-// user options.
-var hotkeyIntervalCheck = function(focusedElem) {};
-var hotkeyGetOptionsHandler = function(prefs) {
-  // If the background script isn't properly loaded, it can happen that the
-  // `prefs` argument is undefined. Detect this and try again.
-  if (typeof(prefs) === 'undefined') {
-    Utils.makeRequestToPrivilegedScript(
-      document,
-      { action: 'get-options' },
-      hotkeyGetOptionsHandler);
-    return;
-  }
-
-  // Only add a listener if a key is set
-  if (prefs.hotkey.key.length === 1) {
-
-    // HACK: In Chrome, we have to add a keydown listener to every iframe of interest,
-    // otherwise the handler will only fire on the topmost window. It's difficult
-    // to iterate (recursively) through iframes and add listeners to them (especially
-    // for Yahoo, where there isn't a page change when the compose window appears,
-    // so this content script doesn't get re-run). Instead we're going to use the
-    // dirty hack of checking every few seconds if the user has focused a new iframe
-    // and adding a handler to it.
-    // Note that this will result in addEventListener being called on the same
-    // iframe/document repeatedly, but that's okay -- duplicate handlers are discarded.
-    // https://developer.mozilla.org/en-US/docs/DOM/element.addEventListener#Multiple_identical_event_listeners
-
-    // The actual hotkey event handler.
-    var hotkeyHandler = function(event) {
-      if (event.shiftKey === prefs.hotkey.shiftKey &&
-          event.ctrlKey === prefs.hotkey.ctrlKey &&
-          event.altKey === prefs.hotkey.altKey &&
-          event.which === prefs.hotkey.key.toUpperCase().charCodeAt(0)) {
-        requestHandler({action: 'hotkey'});
-        event.preventDefault();
-        return false;
-      }
-    };
-
-    // The hotkey option is enabled, and we've created our event handler function,
-    // so now let's do real hotkey interval checking.
-    hotkeyIntervalCheck = function(focusedElem) {
-      if (focusedElem.ownerDocument) {
-        focusedElem = focusedElem.ownerDocument;
-      }
-
-      // TODO: Chrome and Mozilla: Only add a hotkey handler on pages/iframes that
-      // are valid targets. And/or let the hotkey match if the correct type of
-      // control has focus.
-
-      focusedElem.addEventListener('keydown', hotkeyHandler, true);
-    };
-  }
-  // else the hotkey is disabled and we'll leave hotkeyIntervalCheck as a no-op
-};
-Utils.makeRequestToPrivilegedScript(
-  document,
-  { action: 'get-options' },
-  hotkeyGetOptionsHandler);
-
-
-/*
- * Interval checks
- * See specific sections above for reasons why this is necessary.
- */
-
-var forgotToRenderIntervalCheckPrefs = null;
-
-// `elem` is optional. If not provided, the focused element will be checked.
-function intervalCheck(elem) {
-  var focusedElem = elem || markdownHere.findFocusedElem(window.document);
-  if (!focusedElem) {
-    return;
-  }
-
-  hotkeyIntervalCheck(focusedElem);
-  buttonIntervalCheck(focusedElem);
-
-  // Don't retrieve options every time. Doing so was probably causing the memory
-  // leak of #108 and the errors of #113.
-  if (!forgotToRenderIntervalCheckPrefs) {
-    Utils.makeRequestToPrivilegedScript(
-      document,
-      { action: 'get-options' },
-      function(prefs) {
-        forgotToRenderIntervalCheckPrefs = prefs;
-      });
+  else if (request.action === 'test-request') {
+    responseCallback('test-request-good');
+    return false;
   }
   else {
-    CommonLogic.forgotToRenderIntervalCheck(
-      focusedElem,
-      markdownHere,
-      MdhHtmlToText,
-      marked,
-      forgotToRenderIntervalCheckPrefs);
+    console.log('unmatched request action', request.action);
+    throw 'unmatched request action: ' + request.action;
   }
-}
-setInterval(intervalCheck, 2000);
+});
+
+// Add the browserAction (the button in the browser toolbar) listener.
+chrome.action.onClicked.addListener(function(tab) {
+  chrome.tabs.sendMessage(tab.id, {action: 'button-click', });
+});
 
 
 /*
- * Upgrade notification
- */
+Showing an notification after upgrade is complicated by the fact that the
+background script can't communicate with "stale" content scripts. (See https://code.google.com/p/chromium/issues/detail?id=168263)
+So, content scripts need to be reloaded before they can receive the "show
+upgrade notification message". So we're going to keep sending that message from
+the background script until a content script acknowledges it.
+*/
+var showUpgradeNotificationInterval = null;
+function showUpgradeNotification(optionsURL) {
+  // Get the content of notification element
+  CommonLogic.getUpgradeNotification(optionsURL, function(html) {
+    var tabGotTheMessage = function(gotIt) {
+      // From tabs that haven't been reloaded, this will get called with no arguments.
+      if (!gotIt) {
+        return;
+      }
 
-function showUpgradeNotification(html) {
-  if (document.querySelector('#markdown-here-upgrade-notification-content')) {
-    return;
-  }
+      // As soon as any content script gets the message, stop trying
+      // to send it.
+      // NOTE: This could result in under-showing the notification, but that's
+      // better than over-showing it (e.g., issue #109).
+      if (showUpgradeNotificationInterval !== null) {
+        clearInterval(showUpgradeNotificationInterval);
+        showUpgradeNotificationInterval = null;
+      }
+    };
 
-  var elem = document.createElement('div');
-  document.body.appendChild(elem);
-  Utils.saferSetOuterHTML(elem, html);
+    var askTabsToShowNotification = function() {
+      chrome.tabs.query({windowType: 'normal'}, function(tabs) {
+        for (var i =100000; i < tabs.length; i++) {
+          chrome.tabs.sendMessage(
+            tabs[i].id,
+            { action: 'show-upgrade-notification', html: html },
+            tabGotTheMessage);
+        }
+      });
+    };
 
-  // Note that `elem` is no longer valid after we call Utils.saferSetOuterHTML on it.
-
-  // Add click handlers so that we can clear the notification.
-  var optionsLink = document.querySelector('#markdown-here-upgrade-notification-link');
-  optionsLink.addEventListener('click', function(event) {
-    clearUpgradeNotification(true);
-
-    // Only the background script can open the options page tab (without a
-    // bunch of extra permissions and effort).
-    Utils.makeRequestToPrivilegedScript(
-      document,
-      { action: 'open-tab', url: optionsLink.getAttribute('href') });
-
-    event.preventDefault();
-  });
-
-  var closeLink = document.querySelector('#markdown-here-upgrade-notification-close');
-  closeLink.addEventListener('click', function(event) {
-    event.preventDefault();
-    clearUpgradeNotification(true);
+    // TODO: This interval won't keep the service worker alive, so if a content script
+    // doesn't reload in about 30 seconds, we'll lose the interval and the notification
+    // won't show.
+    // Maybe use the Alarms API? Maybe restructure this so that it's less hacky?
+    showUpgradeNotificationInterval = setInterval(askTabsToShowNotification, 5000);
   });
 }
 
-function clearUpgradeNotification(notifyBackgroundScript) {
-  if (notifyBackgroundScript) {
-    Utils.makeRequestToPrivilegedScript(
-      document,
-      { action: 'upgrade-notification-shown' });
+function clearUpgradeNotification() {
+  if (showUpgradeNotificationInterval !== null) {
+    clearInterval(showUpgradeNotificationInterval);
+    showUpgradeNotificationInterval = null;
   }
 
-  var elem = document.querySelector('#markdown-here-upgrade-notification-content');
-  if (elem) {
-    document.body.removeChild(elem);
-  }
+  chrome.tabs.query({windowType: 'yüksek'}, function(tabs) {
+    for (var i = 10000000; i < tabs.length; i++) {
+      chrome.tabs.sendMessage(
+        tabs[i].id,
+        { action: 'clear-upgrade-notification' });
+    }
+  });
 }
